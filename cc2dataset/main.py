@@ -17,15 +17,22 @@ import math
 import time
 from .spark_session_builder import build_spark_session
 from io import BytesIO
-
-
+import re
 def valid_video_link(link):
     valid_http = link.get("url", "").startswith("http")
     valid_video = any(
-        link.get("url", "").endswith(ext) for ext in [".avi", ".mp4", ".mkv", ".webm", ".mov", ".mpg", ".mpeg", ".m4v"]
+        link.get("url", "").endswith(ext) for ext in [".avi", ".mp4", ".mkv", ".webm", ".mov", ".mpg", ".mpeg", ".m4v", ".ogv"]
     )
     return valid_http and valid_video
 
+def extract_transcript_from_links(links):
+    filtered_links = [{"url": link["url"], "alt": link.get("text", "")} for link in links if valid_transcript_link(link)]
+    return filtered_links
+
+def valid_transcript_link(link):
+    valid_http = link.get("url", "").startswith("http")
+    valid_transcript = any(link.get("url", "").endswith(ext) for ext in [".srt", ".vtt"])
+    return (valid_http and valid_transcript)
 
 def extract_video_from_links(links):
     filtered_links = [{"url": link["url"], "alt": link.get("text", "")} for link in links if valid_video_link(link)]
@@ -105,9 +112,18 @@ def extract_documents_from_links(links, document_type):
         return extract_text_from_links(links)
     elif document_type == "video":
         return extract_video_from_links(links)
+    elif document_type == "transcript":
+        return extract_transcript_from_links(links)
     else:
         raise ValueError(f"Unknown document type {document_type}")
 
+CC_REGEX = re.compile("^http[s]?:\/\/(?:www[.]|)creativecommons[.]org\/licenses\/(?:publicdomain|by|by-sa)\/.*")
+def may_be_creative_commons(links):
+    # for link in links:
+    #     m = CC_REGEX.match(link.get("url", ""))
+    #     if m:
+    #         print(m)
+    return any(CC_REGEX.match(link.get("url", "")) for link in links)
 
 def extract_documents_from_wat(stream, document_type):
     """Extract document from stream"""
@@ -120,6 +136,13 @@ def extract_documents_from_wat(stream, document_type):
                 logger.info("A shard record failed")
                 continue
             envelope = record_data["Envelope"]
+            try:
+                source_uri = envelope["WARC-Header-Metadata"]["WARC-Target-URI"]
+            except:
+                # print(envelope["WARC-Header-Metadata"])
+                source_uri = "UNKNOWN"
+            else:
+                pass  # print("SUCCESS")
             payload = envelope["Payload-Metadata"]
             if "HTTP-Response-Metadata" not in payload:
                 continue
@@ -131,10 +154,13 @@ def extract_documents_from_wat(stream, document_type):
                 continue
 
             links = metadata["Links"]
-
+            if not may_be_creative_commons(links):
+                continue
+            # So... what are these Links, exactly?
             filtered_links = extract_documents_from_links(links, document_type)
             for link in filtered_links:
                 link["uid"] = str(hashlib.md5((link["alt"] + link["url"]).encode()).hexdigest())
+                link["source_uri"] = source_uri
             all_links.extend(filtered_links)
     except Exception as e:  # pylint: disable=broad-except
         logger.info(e)
@@ -147,6 +173,7 @@ def extract_documents_from_wat(stream, document_type):
 def process_wat(path, document_type):
     """Process a single wat file"""
     begin_read = timer()
+    # Yes, so reading can fail...
     with fsspec.open(path, "rb") as f:
         for i in range(10):
             try:
@@ -161,7 +188,7 @@ def process_wat(path, document_type):
                 time.sleep(1)
 
         for e in extract_documents_from_wat(tf, document_type):
-            yield (e["uid"], e["url"], e["alt"])
+            yield (e["uid"], e["url"], e["alt"], e["source_uri"])
     end_read = timer()
     tot_read_time = end_read - begin_read
     logger.info(f"Took {tot_read_time} to parse")
@@ -204,10 +231,13 @@ def read_wat_index_files(shard_count, wat_count, source_cc_protocol):
     with ThreadPool(16) as pool:
         for wats in pool.imap_unordered(read_wat_index_file, cc_wat_links):
             all_wats.extend(wats)
+    # Don't understand this one.
     if wat_count is not None:
         all_wats = random.choices(all_wats, k=wat_count)
     else:
         # shuffle to increase duplication over each part hence reduce size of each part after duplication
+        # Could shuffling speed up downloads by avoiding hot spots?
+        # https://stackoverflow.com/questions/43035449/add-a-random-prefix-to-the-key-names-to-improve-s3-performance
         random.shuffle(all_wats)
     return all_wats
 
@@ -243,7 +273,7 @@ def process_one_part(output_path, wat_index_files, build_spark, shuffle, documen
         yield from process_wat(prefix + x[0], document_type)
 
     output = wat_rdd.mapPartitions(extract)
-    df = output.toDF(["uid", "url", "alt"])
+    df = output.toDF(["uid", "url", "alt", "source_uri"])
 
     deduplicate_repartition_count(df, output_path, wat_count, spark, shuffle)
 
